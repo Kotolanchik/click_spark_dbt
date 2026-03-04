@@ -11,6 +11,7 @@
 - `docs/clickhouse.md` — архитектура ClickHouse, особенности, паттерны и примеры SQL
 - `docs/dbt.md` — архитектура dbt, ключевые сущности, практики и примеры проекта
 - `docs/spark.md` — архитектура Spark, особенности производительности, примеры PySpark
+- `docs/ad-hoc.md` — определение ad‑hoc и варианты реализации
 - `docs/examples-end-to-end.md` — сквозной пример: **Spark → ClickHouse → dbt**
 - `docker-compose.yml` — локальный ClickHouse для запуска примеров
 - `spark_jobs/` — пример Spark job (генерация событий и загрузка в ClickHouse)
