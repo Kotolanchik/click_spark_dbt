@@ -36,6 +36,20 @@ Spark чаще всего используют как «вычислительн
 
 Практика: для ETL/аналитики чаще выбирают **DataFrame/Spark SQL** (Catalyst/Tungsten быстрее), а RDD — «escape hatch».
 
+#### Важный вопрос: «всё в Spark — это RDD?»
+
+Коротко: **нет на уровне API**, но **часто да на уровне исполнения**.
+
+- **Dataset/DataFrame** — это *табличная* абстракция (логический план + оптимизации Catalyst/Tungsten).
+- **RDD** — это *низкоуровневая* распределённая коллекция.
+- Когда вы вызываете action над **Dataset/DataFrame**, Spark строит физический план, и внутри он часто исполняется как цепочки задач, которые исторически опираются на RDD‑похожий механизм вычисления партиций (но это **не значит**, что вы «работаете с RDD» как с основным API).
+- В **Structured Streaming** в режиме микро‑батчей каждый «тик» — это **один batch‑прогон** того же самого Dataset‑пайплайна над новым диапазоном данных. Внутри это снова превращается в задачи по партициям (и да, там будут структуры уровня RDD/Tasks), но снаружи вы пишете `readStream/writeStream`, а не `RDD`.
+
+Практическое правило:
+
+- если у вас `spark.read` / `df.write` → вы в мире batch Dataset/DataFrame;
+- если у вас `spark.readStream` / `df.writeStream` → вы в мире streaming (микро‑батчи/continuous), даже если «внутри» оно исполняется батч‑итерациями.
+
 ---
 
 ### Архитектура (как устроен Spark)
@@ -97,11 +111,11 @@ Spark чаще всего используют как «вычислительн
 Мини‑пример запуска с конфигами:
 
 ```bash
-spark-submit \
+spark-shell \
   --master local[4] \
   --conf spark.sql.shuffle.partitions=64 \
   --conf spark.default.parallelism=64 \
-  spark_jobs/generate_events_parquet.py --n 200000 --out examples/events.parquet
+  -i spark_jobs/generate_events_parquet.scala
 ```
 
 ---
@@ -125,93 +139,117 @@ spark-submit \
 
 #### 1) Batch ETL (файлы → агрегаты → ClickHouse)
 
-```python
-from pyspark.sql import functions as F
+Почему это **batch**:
 
+- источник **ограничен** (bounded): конкретная папка Parquet,
+- есть начало и конец вычисления: программа отработала и завершилась,
+- не нужен checkpoint для продолжения «с места остановки».
+
+Пример на Scala (Dataset/DataFrame API):
+
+```scala
+import org.apache.spark.sql.functions._
+
+// Конфиги уровня сессии (можно задавать и через spark-submit/spark-shell --conf)
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 spark.conf.set("spark.sql.shuffle.partitions", "64")
 
-events = (
-    spark.read.parquet("examples/events.parquet")
-    .withColumn("event_time", F.to_timestamp("event_time"))
-    .withColumn("event_date", F.to_date("event_time"))
-    .withColumn("price", F.col("price").cast("decimal(12,2)"))
-)
+// Bounded source: читаем статичные файлы Parquet -> это batch
+val events = spark.read
+  .parquet("examples/events.parquet")
+  // Ниже — типовые преобразования, это ещё не выполнение (lazy)
+  .withColumn("event_time", to_timestamp(col("event_time")))
+  .withColumn("event_date", to_date(col("event_time")))
+  .withColumn("price", col("price").cast("decimal(12,2)"))
 
-daily = (
-    events.groupBy("event_date", "platform")
-    .agg(
-        F.sum(F.when(F.col("event_name") == "purchase", F.col("price")).otherwise(F.lit(0))).alias("revenue"),
-        F.sum(F.when(F.col("event_name") == "purchase", F.lit(1)).otherwise(F.lit(0))).alias("purchases"),
-        F.countDistinct(F.when(F.col("event_name") == "purchase", F.col("user_id"))).alias("buyers"),
-    )
-)
+val daily = events
+  .groupBy(col("event_date"), col("platform"))
+  .agg(
+    // Условная агрегация — типичный паттерн для витрин
+    sum(when(col("event_name") === lit("purchase"), col("price")).otherwise(lit(0))).as("revenue"),
+    sum(when(col("event_name") === lit("purchase"), lit(1)).otherwise(lit(0))).as("purchases"),
+    countDistinct(when(col("event_name") === lit("purchase"), col("user_id"))).as("buyers")
+  )
 
-(
-    daily.write.format("jdbc")
-    .option("url", "jdbc:clickhouse://localhost:8123/analytics")
-    .option("dbtable", "daily_revenue_spark")
-    .option("user", "default")
-    .option("password", "")
-    .mode("append")
-    .save()
-)
+// Запись результата: один раз посчитали -> один раз записали -> завершили
+// Для JDBC нужен драйвер (обычно через --packages или --jars)
+daily.write
+  .format("jdbc")
+  .option("url", "jdbc:clickhouse://localhost:8123/analytics")
+  .option("dbtable", "daily_revenue_spark")
+  .option("user", "default")
+  .option("password", "")
+  .mode("append")
+  .save()
 ```
 
 #### 2) Streaming (Kafka → микро‑батчи → ClickHouse)
 
 Structured Streaming обычно работает микро‑батчами. Паттерн для ClickHouse — `foreachBatch`:
 
-```python
-from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
+Почему это **streaming**:
 
-schema = StructType([
-    StructField("event_time", StringType()),
-    StructField("user_id", LongType()),
-    StructField("session_id", StringType()),
-    StructField("event_name", StringType()),
-    StructField("platform", StringType()),
-    StructField("price", DoubleType()),
-    StructField("props_json", StringType()),
-])
+- источник **неограничен** (unbounded): Kafka‑топик «идёт бесконечно»,
+- приложение **должно жить постоянно** и обрабатывать новые данные,
+- нужен **checkpoint**, чтобы при рестарте продолжить обработку корректно,
+- Spark выполняет вычисления **микро‑батчами** (каждые \(N\) секунд), но весь режим всё равно streaming.
 
-raw = (
-    spark.readStream.format("kafka")
-    .option("kafka.bootstrap.servers", "localhost:9092")
-    .option("subscribe", "events")
-    .option("startingOffsets", "latest")
-    .load()
-)
+Пример на Scala (Kafka → foreachBatch → ClickHouse):
 
-events = (
-    raw.select(F.from_json(F.col("value").cast("string"), schema).alias("v"))
-    .select("v.*")
-    .withColumn("event_time", F.to_timestamp("event_time"))
-    .withColumn("event_date", F.to_date("event_time"))
-)
+```scala
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.streaming.Trigger
+import org.apache.spark.sql.types._
 
-def write_to_clickhouse(batch_df, batch_id: int) -> None:
-    (
-        batch_df.select(
-            "event_time", "user_id", "session_id", "event_name", "platform", "price", "props_json"
-        )
-        .write.format("jdbc")
-        .option("url", "jdbc:clickhouse://localhost:8123/analytics")
-        .option("dbtable", "events")
-        .option("user", "default")
-        .option("password", "")
-        .mode("append")
-        .save()
-    )
+// Схема JSON-сообщения в Kafka (value)
+val schema = StructType(Seq(
+  StructField("event_time", StringType),
+  StructField("user_id", LongType),
+  StructField("session_id", StringType),
+  StructField("event_name", StringType),
+  StructField("platform", StringType),
+  StructField("price", DoubleType),
+  StructField("props_json", StringType)
+))
 
-q = (
-    events.writeStream
-    .foreachBatch(write_to_clickhouse)
-    .option("checkpointLocation", "/tmp/chk/events_to_clickhouse")
-    .trigger(processingTime="10 seconds")
-    .start()
-)
+// Unbounded source: Kafka -> это streaming
+val raw = spark.readStream
+  .format("kafka")
+  .option("kafka.bootstrap.servers", "localhost:9092")
+  .option("subscribe", "events")
+  .option("startingOffsets", "latest")
+  .load()
+
+val events = raw
+  // Kafka value (bytes) -> string -> JSON -> колонки
+  .select(from_json(col("value").cast("string"), schema).as("v"))
+  .select("v.*")
+  .withColumn("event_time", to_timestamp(col("event_time")))
+
+def writeToClickHouse(batchDf: DataFrame, batchId: Long): Unit = {
+  // Внутри foreachBatch у нас обычный batch DataFrame:
+  // можно делать любые batch-операции и один раз писать результат
+  batchDf
+    .select("event_time", "user_id", "session_id", "event_name", "platform", "price", "props_json")
+    .write
+    .format("jdbc")
+    .option("url", "jdbc:clickhouse://localhost:8123/analytics")
+    .option("dbtable", "events")
+    .option("user", "default")
+    .option("password", "")
+    .mode("append")
+    .save()
+}
+
+val q = events.writeStream
+  .foreachBatch(writeToClickHouse _)
+  // Checkpoint обязателен: хранит прогресс (offsets) и состояние (если есть stateful-операторы)
+  .option("checkpointLocation", "/tmp/chk/events_to_clickhouse")
+  // Микро-батч раз в 10 секунд: компромисс latency/стоимость
+  .trigger(Trigger.ProcessingTime("10 seconds"))
+  .start()
+
 q.awaitTermination()
 ```
 
@@ -219,17 +257,59 @@ q.awaitTermination()
 
 **Near‑real‑time** в данных — задержка порядка **секунд/десятков секунд/минут**, не «мгновенно».
 
+Почему это **не отдельный режим Spark**, а характеристика пайплайна:
+
+- если вы обрабатываете события каждые 5–10 секунд и пишете в OLAP, то результат «почти real‑time»;
+- если раз в час — это уже классический batch.
+
 Типовые реализации:
 
 - **Spark Structured Streaming** с коротким `trigger(processingTime="5-10 seconds")` + `foreachBatch` (как выше).
 - **Kafka → ClickHouse напрямую** (Kafka engine) + **Materialized View** для витрин (часто даёт меньшую задержку и меньше движущихся частей).
 - **ClickHouse Materialized Views** для инкрементальных агрегатов поверх «сырой» таблицы (подходит для дашбордов).
 
+Мини‑пример NRT‑агрегации в streaming (окна + watermark):
+
+```scala
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.streaming.Trigger
+
+// events: DataFrame из предыдущего примера (readStream)
+val nrtAgg = events
+  // Watermark нужен, чтобы ограничить состояние при работе с late events
+  .withWatermark("event_time", "10 minutes")
+  .groupBy(
+    window(col("event_time"), "1 minute"),
+    col("platform")
+  )
+  .agg(
+    sum(when(col("event_name") === lit("purchase"), col("price")).otherwise(lit(0))).as("revenue_1m")
+  )
+
+// Это streaming: агрегаты считаются постоянно, а "near-real-time" задаётся триггером
+val q2 = nrtAgg.writeStream
+  .outputMode("update")
+  .foreachBatch { (batchDf, batchId) =>
+    // Каждая минутная "дельта" попадает в ClickHouse почти сразу после завершения микро-батча
+    batchDf.write
+      .format("jdbc")
+      .option("url", "jdbc:clickhouse://localhost:8123/analytics")
+      .option("dbtable", "revenue_1m_nrt")
+      .option("user", "default")
+      .option("password", "")
+      .mode("append")
+      .save()
+  }
+  .option("checkpointLocation", "/tmp/chk/revenue_1m_nrt")
+  .trigger(Trigger.ProcessingTime("10 seconds"))
+  .start()
+```
+
 ---
 
 ### «Живые» примеры в этом репозитории
 
-- Генерация Parquet через Spark: `spark_jobs/generate_events_parquet.py`
+- Генерация Parquet через Spark (Scala): `spark_jobs/generate_events_parquet.scala`
 - Сквозной пример: `docs/examples-end-to-end.md`
 
 ---

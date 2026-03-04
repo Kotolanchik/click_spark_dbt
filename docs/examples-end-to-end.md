@@ -10,7 +10,7 @@
 
 - Docker + Docker Compose
 - Spark 3.x (локально) или любой способ запустить `spark-submit`
-- Python (если запускаете PySpark локально)
+- Scala/`spark-shell` (для примеров на Scala; Python вариант тоже возможен)
 - dbt Core + адаптер для ClickHouse (например, `dbt-clickhouse`)
 
 ---
@@ -39,16 +39,22 @@ docker exec -i clickhouse clickhouse-client < examples/clickhouse_init.sql
 
 ### 3) Сгенерировать Parquet в Spark
 
-Скрипт лежит в `spark_jobs/generate_events_parquet.py` и пишет Parquet в `examples/events.parquet/`.
+Скрипт лежит в `spark_jobs/generate_events_parquet.scala` и пишет Parquet в `examples/events.parquet/`.
 
 ```bash
-spark-submit spark_jobs/generate_events_parquet.py --n 200000 --out examples/events.parquet
+N=200000 OUT=examples/events.parquet spark-shell --master local[4] -i spark_jobs/generate_events_parquet.scala
 ```
 
 Проверка, что Parquet появился:
 
 ```bash
 ls -la examples/events.parquet
+```
+
+Если удобнее Python (опционально), остаётся рабочий вариант:
+
+```bash
+spark-submit spark_jobs/generate_events_parquet.py --n 200000 --out examples/events.parquet
 ```
 
 ---
