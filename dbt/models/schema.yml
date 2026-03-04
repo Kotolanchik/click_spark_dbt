@@ -1,0 +1,44 @@
+version: 2
+
+sources:
+  - name: raw
+    database: analytics
+    schema: analytics
+    tables:
+      - name: events
+        description: "Сырые события, загруженные (например) Spark'ом в ClickHouse."
+        columns:
+          - name: event_time
+            tests:
+              - not_null
+          - name: user_id
+            tests:
+              - not_null
+          - name: event_name
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ["page_view", "add_to_cart", "purchase"]
+
+models:
+  - name: stg_events
+    description: "Staging слой: типизация и минимальная нормализация raw событий."
+    columns:
+      - name: event_time
+        tests: [not_null]
+      - name: user_id
+        tests: [not_null]
+      - name: event_name
+        tests: [not_null]
+
+  - name: fct_daily_revenue
+    description: "Факт-таблица: дневная выручка и покупки по платформам."
+    columns:
+      - name: event_date
+        tests: [not_null]
+      - name: platform
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["web", "ios", "android"]
+
