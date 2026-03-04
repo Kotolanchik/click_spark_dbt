@@ -305,11 +305,35 @@ val q2 = nrtAgg.writeStream
   .start()
 ```
 
+Готовая реализация в этом репозитории (можно запускать как `spark-shell` скрипт):
+
+- `spark_jobs/nrt_revenue_1m.scala` — NRT streaming с `trigger`, `window`, `watermark`, выводом в консоль или записью в ClickHouse.
+- `examples/clickhouse_nrt.sql` — таблица‑приёмник в ClickHouse (ReplacingMergeTree по `updated_at`).
+
+Запуск «без внешних зависимостей» (источник `rate`, вывод в консоль):
+
+```bash
+TRIGGER="5 seconds" SOURCE=rate SINK=console spark-shell --master local[2] -i spark_jobs/nrt_revenue_1m.scala
+```
+
+Запуск с записью в ClickHouse (таблицу создайте заранее):
+
+```bash
+# создать таблицу
+docker exec -i clickhouse clickhouse-client < examples/clickhouse_nrt.sql
+
+# запустить стриминг (потребуется JDBC драйвер ClickHouse)
+SOURCE=rate SINK=clickhouse CLICKHOUSE_URL="jdbc:clickhouse://localhost:8123/analytics" \
+CLICKHOUSE_TABLE="revenue_1m_nrt" TRIGGER="5 seconds" \
+spark-shell --master local[2] -i spark_jobs/nrt_revenue_1m.scala
+```
+
 ---
 
 ### «Живые» примеры в этом репозитории
 
 - Генерация Parquet через Spark (Scala): `spark_jobs/generate_events_parquet.scala`
+- Near‑real‑time streaming пример (Scala): `spark_jobs/nrt_revenue_1m.scala`
 - Сквозной пример: `docs/examples-end-to-end.md`
 
 ---
